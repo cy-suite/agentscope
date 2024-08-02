@@ -56,6 +56,7 @@ Note:
 from __future__ import annotations
 import inspect
 import time
+import math
 from abc import ABCMeta
 from functools import wraps
 from typing import Sequence, Any, Callable, Union, List, Type
@@ -71,6 +72,7 @@ from ..message import Msg
 from ..utils import MonitorFactory
 from ..utils.monitor import get_full_name
 from ..utils.tools import _get_timestamp
+from ..utils.resource_limiter import resources_limit
 from ..constants import _DEFAULT_MAX_RETRIES
 from ..constants import _DEFAULT_RETRY_INTERVAL
 
@@ -148,7 +150,31 @@ class _ModelWrapperMeta(ABCMeta):
 
     def __new__(mcs, name: Any, bases: Any, attrs: Any) -> Any:
         if "__call__" in attrs:
-            attrs["__call__"] = _response_parse_decorator(attrs["__call__"])
+            original_call = attrs["__call__"]
+
+            def new_call(  # type: ignore[no-untyped-def]
+                self,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Callable:
+                if (
+                    getattr(self, "resource_limit_type", None)
+                    not in ["capacity", "rate"]
+                    or getattr(self, "resource_limit_number", math.inf)
+                    == math.inf
+                ):
+                    # No resource limit applied
+                    wrapped_call = _response_parse_decorator(original_call)
+                else:
+                    # Resource limit applied
+                    wrapped_call = _response_parse_decorator(
+                        resources_limit(original_call),
+                    )
+
+                return wrapped_call(self, *args, **kwargs)
+
+            attrs["__call__"] = new_call
+
         return super().__new__(mcs, name, bases, attrs)
 
     def __init__(cls, name: Any, bases: Any, attrs: Any) -> None:
@@ -198,6 +224,12 @@ class ModelWrapperBase(metaclass=_ModelWrapperMeta):
         self.monitor = MonitorFactory.get_monitor()
 
         self.config_name = config_name
+        self.resource_limit_type = kwargs.pop("resource_limit_type", None)
+        self.resource_limit_key = kwargs.pop("resource_limit_number", None)
+        self.resource_limit_number = kwargs.pop(
+            "resource_limit_number",
+            math.inf,
+        )
         logger.info(f"Initialize model by configuration [{config_name}]")
 
     @classmethod
