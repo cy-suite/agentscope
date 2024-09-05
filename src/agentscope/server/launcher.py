@@ -7,12 +7,15 @@ import signal
 import argparse
 import time
 import importlib
+import multiprocessing
 from multiprocessing import Process, Event, Pipe
 from multiprocessing.synchronize import Event as EventClass
 from concurrent import futures
 from loguru import logger
+import requests
 
 try:
+    import dill
     import grpc
     from agentscope.rpc.rpc_agent_pb2_grpc import (
         add_RpcAgentServicer_to_server,
@@ -20,17 +23,44 @@ try:
 except ImportError as import_error:
     from agentscope.utils.common import ImportErrorReporter
 
+    dill = ImportErrorReporter(import_error, "distribute")
     grpc = ImportErrorReporter(import_error, "distribute")
     add_RpcAgentServicer_to_server = ImportErrorReporter(
         import_error,
         "distribute",
     )
 import agentscope
+from agentscope.studio._client import _studio_client
+from agentscope.exception import StudioRegisterError
 from ..server.servicer import AgentServerServicer
 from ..manager import ASManager
 from ..agents.agent import AgentBase
 from ..utils.common import _check_port, _generate_id_from_seed
 from ..constants import _DEFAULT_RPC_OPTIONS
+
+
+def _register_server_to_studio(
+    studio_url: str,
+    server_id: str,
+    host: str,
+    port: int,
+) -> None:
+    """Register a server to studio."""
+    url = f"{studio_url}/api/servers/register"
+    resp = requests.post(
+        url,
+        json={
+            "server_id": server_id,
+            "host": host,
+            "port": port,
+        },
+        timeout=10,  # todo: configurable timeout
+    )
+    if resp.status_code != 200:
+        logger.error(f"Failed to register server: {resp.text}")
+        raise StudioRegisterError(f"Failed to register server: {resp.text}")
+    run_id = ASManager.get_instance().run_id
+    _studio_client.initialize(run_id, studio_url)
 
 
 def _setup_agent_server(
@@ -151,19 +181,8 @@ async def _setup_agent_server_async(  # pylint: disable=R0912
             The abs path to the directory containing customized agent python
             files.
     """
-
     if init_settings is not None:
         ASManager.get_instance().load_dict(init_settings)
-
-    servicer = AgentServerServicer(
-        stop_event=stop_event,
-        host=host,
-        port=port,
-        server_id=server_id,
-        studio_url=studio_url,
-        max_pool_size=max_pool_size,
-        max_timeout_seconds=max_timeout_seconds,
-    )
     if custom_agent_classes is None:
         custom_agent_classes = []
     if agent_dir is not None:
@@ -189,6 +208,47 @@ async def _setup_agent_server_async(  # pylint: disable=R0912
                 sig,
                 lambda: asyncio.create_task(shutdown_signal_handler()),
             )
+    if studio_url is not None:
+        _register_server_to_studio(
+            studio_url=studio_url,
+            server_id=server_id,
+            host=host,
+            port=port,
+        )
+
+    # start cpp server
+    if os.environ.get("AGENTSCOPE_USE_CPP_SERVER", "").lower() == "yes":
+        from agentscope.cpp_server.cpp_server import setup_cpp_server, shutdown_cpp_server
+        num_workers = int(os.environ.get('AGENTSCOPE_NUM_WORKERS', f'{multiprocessing.cpu_count()}'))
+        setup_cpp_server(
+            host, str(port), max_pool_size, max_timeout_seconds, True,
+            server_id, str(studio_url), num_workers
+        )
+        logger.info(
+            f"CPP agent server [{server_id}] at {host}:{port} "
+            "started successfully",
+        )
+        if start_event is not None:
+            pipe.send(port)
+            start_event.set()
+        if stop_event is not None:
+            stop_event.wait()
+            logger.info(
+                f"CPP agent server [{server_id}] at {host}:{port} "
+                "stopped successfully",
+            )
+            shutdown_cpp_server()
+        return
+
+    servicer = AgentServerServicer(
+        stop_event=stop_event,
+        host=host,
+        port=port,
+        server_id=server_id,
+        studio_url=studio_url,
+        max_pool_size=max_pool_size,
+        max_timeout_seconds=max_timeout_seconds,
+    )
     while True:
         try:
             port = _check_port(port)
